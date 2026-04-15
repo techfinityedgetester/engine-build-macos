@@ -81,14 +81,21 @@ jobs:
           # Symlink gen_snapshot_arm64
           ln -sf gen_snapshot engine/src/out/mac_release_arm64/gen_snapshot_arm64
 
-          # Find dart-sdk — prioritize host_release
+          # Find dart-sdk — search all possible locations
           echo "Searching for dart-sdk..."
-          DART_SDK_PATH=$(find engine/src/out -path "*host_release*/dart-sdk" | head -n 1)
+          echo "All dart-sdk locations:"
+          find engine/src -type d -name dart-sdk 2>/dev/null
+
+          DART_SDK_PATH=$(find engine/src/out/mac_release -type d -name dart-sdk 2>/dev/null | head -n 1)
           if [ -z "$DART_SDK_PATH" ]; then
-            DART_SDK_PATH=$(find engine/src/out -type d -name dart-sdk | head -n 1)
+            DART_SDK_PATH=$(find engine/src/out -type d -name dart-sdk 2>/dev/null | head -n 1)
           fi
           if [ -z "$DART_SDK_PATH" ]; then
-            echo "❌ dart-sdk not found"
+            DART_SDK_PATH=$(find engine/src/third_party/dart -type d -name dart-sdk 2>/dev/null | head -n 1)
+          fi
+          if [ -z "$DART_SDK_PATH" ]; then
+            echo "❌ dart-sdk not found anywhere"
+            find engine/src -name "dart" -type f 2>/dev/null | head -10
             exit 1
           fi
           echo "✅ dart-sdk found at $DART_SDK_PATH"
@@ -106,6 +113,6 @@ jobs:
         with:
           name: mac_release_arm64
           path: |
-            engine/src/out/mac_release_arm64/
-            engine/src/flutter/prebuilts/
+             engine/src/out/mac_release_arm64/
+             engine/src/flutter/prebuilts/macos-x64/
           retention-days: 7
