@@ -1,0 +1,111 @@
+name: Build Koolbase Engine
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup depot_tools
+        run: |
+          set -e
+          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
+          echo "$PWD/depot_tools" >> $GITHUB_PATH
+
+      - name: Fetch Flutter engine
+        run: |
+          set -e
+          mkdir engine && cd engine
+          printf '%s\n' \
+            "solutions = [" \
+            "  {" \
+            "    \"managed\": False," \
+            "    \"name\": \"src/flutter\"," \
+            "    \"url\": \"https://github.com/flutter/engine.git\"," \
+            "    \"custom_deps\": {}," \
+            "    \"deps_file\": \"DEPS\"," \
+            "    \"safesync_url\": \"\"," \
+            "  }," \
+            "]" > .gclient
+          gclient sync --no-history --shallow
+          cd src/flutter
+          git fetch origin refs/tags/3.22.3
+          git checkout FETCH_HEAD
+          cd ../..
+          gclient sync --no-history --shallow
+
+      - name: Apply Koolbase patches
+        run: |
+          set -e
+          python3 patch_dart_cc.py
+
+      - name: Fix freetype2 build issue
+        run: |
+          set -e
+          python3 -c "
+          path = 'engine/src/flutter/third_party/freetype2/src/gzip/zutil.h'
+          with open(path) as f:
+              content = f.read()
+          content = content.replace('#  define OS_CODE 19', '#  undef OS_CODE\n#  define OS_CODE 19')
+          with open(path, 'w') as f:
+              f.write(content)
+          print('Fixed freetype2 zutil.h')
+          "
+
+      - name: Build engine
+        run: |
+          set -e
+          cd engine/src/flutter
+          ./tools/gn --runtime-mode=release --no-stripped --mac-cpu=arm64 --target-os=mac --no-lto
+          ./tools/gn --runtime-mode=release --no-stripped --mac-cpu=x64 --target-os=mac --no-lto
+          cd ..
+          ninja -C out/mac_release_arm64 macos
+          ninja -C out/mac_release_arm64 gen_snapshot
+          ninja -C out/mac_release_arm64 flutter_patched_sdk
+          ninja -C out/mac_release gen_snapshot
+
+      - name: Prepare artifact
+        run: |
+          set -e
+
+          # Symlink gen_snapshot_arm64
+          ln -sf gen_snapshot engine/src/out/mac_release_arm64/gen_snapshot_arm64
+
+          # Find dart-sdk — prioritize host_release
+          echo "Searching for dart-sdk..."
+          DART_SDK_PATH=$(find engine/src/out -path "*host_release*/dart-sdk" | head -n 1)
+          if [ -z "$DART_SDK_PATH" ]; then
+            DART_SDK_PATH=$(find engine/src/out -type d -name dart-sdk | head -n 1)
+          fi
+          if [ -z "$DART_SDK_PATH" ]; then
+            echo "❌ dart-sdk not found"
+            exit 1
+          fi
+          echo "✅ dart-sdk found at $DART_SDK_PATH"
+          mkdir -p engine/src/flutter/prebuilts/macos-x64/
+          cp -r "$DART_SDK_PATH" engine/src/flutter/prebuilts/macos-x64/dart-sdk
+
+          # Verify
+          echo "=== mac_release_arm64 contents ==="
+          ls -la engine/src/out/mac_release_arm64/
+          echo "=== prebuilts contents ==="
+          ls -la engine/src/flutter/prebuilts/macos-x64/
+
+      - name: Upload engine output
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac_release_arm64
+          path: |
+            engine/src/out/mac_release_arm64/
+            engine/src/flutter/prebuilts/
+          retention-days: 7
