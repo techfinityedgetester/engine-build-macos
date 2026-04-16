@@ -5,7 +5,7 @@ on:
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
       - name: Checkout
@@ -66,8 +66,8 @@ jobs:
         run: |
           set -e
           cd engine/src/flutter
-          ./tools/gn --runtime-mode=release --no-stripped --mac-cpu=arm64 --target-os=mac --no-lto
-          ./tools/gn --runtime-mode=release --no-stripped --mac-cpu=x64 --target-os=mac --no-lto
+          ./tools/gn --runtime-mode=release --no-stripped --mac-cpu=arm64 --target-os=mac --no-lto --no-prebuilt-dart-sdk
+          ./tools/gn --runtime-mode=release --no-stripped --mac-cpu=x64 --target-os=mac --no-lto --no-prebuilt-dart-sdk
           cd ..
           ninja -C out/mac_release_arm64 macos
           ninja -C out/mac_release_arm64 gen_snapshot
@@ -113,6 +113,6 @@ jobs:
         with:
           name: mac_release_arm64
           path: |
-             engine/src/out/mac_release_arm64/
-             engine/src/flutter/prebuilts/macos-x64/
+            engine/src/out/mac_release_arm64/
+            engine/src/flutter/prebuilts/macos-x64/
           retention-days: 7
