@@ -21,7 +21,6 @@ koolbase_code = '''
 static bool Koolbase_FetchPatch(uint8_t* buf, size_t buf_len) {
   const char* host = "127.0.0.1";
   const char* port_str = "9876";
-  const char* path = "/patch";
 
   struct addrinfo hints = {};
   struct addrinfo* res = nullptr;
