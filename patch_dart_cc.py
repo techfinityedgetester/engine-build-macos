@@ -13,10 +13,11 @@ include_addition = include_marker + '''
 #include <cstdlib>
 #include <sys/socket.h>
 #include <netdb.h>
-#include <unistd.h>'''
+#include <unistd.h>
+#include <sys/mman.h>'''
 content = content.replace(include_marker, include_addition, 1)
 
-# Add Koolbase fetch function before namespace flutter {
+# Koolbase helpers + struct
 koolbase_code = '''
 static bool Koolbase_FetchPatch(uint8_t* buf, size_t buf_len) {
   const char* host = "127.0.0.1";
@@ -78,6 +79,50 @@ static bool Koolbase_FetchPatch(uint8_t* buf, size_t buf_len) {
   return true;
 }
 
+// Scan memory pages near snapshot_data for our price marker and patch it
+static bool Koolbase_FindAndPatchMarker(const uint8_t* snapshot_data,
+                                        size_t scan_size,
+                                        const char* new_price) {
+  const char* marker = "KBPRICE@@@";
+  size_t marker_len = 10;
+
+  // Scan forward from snapshot_data
+  for (size_t i = 0; i < scan_size - marker_len - 3; i++) {
+    bool match = true;
+    for (size_t j = 0; j < marker_len; j++) {
+      if (snapshot_data[i+j] != marker[j]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) {
+      // Found it — patch the 3 digits at i+10
+      uint8_t* target = (uint8_t*)(snapshot_data + i + 10);
+
+      // Make page writable
+      size_t page_size = 4096;
+      uintptr_t page_start = (uintptr_t)target & ~(page_size - 1);
+      if (mprotect((void*)page_start, page_size * 2, PROT_READ | PROT_WRITE) != 0) {
+        printf("** Koolbase: mprotect failed **\\n");
+        return false;
+      }
+
+      target[0] = new_price[0];
+      target[1] = new_price[1];
+      target[2] = new_price[2];
+
+      // Restore protection
+      mprotect((void*)page_start, page_size * 2, PROT_READ);
+
+      printf("** Koolbase: patched marker at offset 0x%lx **\\n", (unsigned long)i);
+      fflush(stdout);
+      return true;
+    }
+  }
+  printf("** Koolbase: marker not found in scan **\\n");
+  return false;
+}
+
 struct KbPatchHeader {
   uint8_t  magic[4];
   uint16_t version;
@@ -97,50 +142,35 @@ namespace flutter {'''
 
 content = content.replace('namespace flutter {', koolbase_code, 1)
 
-# Inject hook inside PrepareForRunningFromPrecompiledCode (right after phase_ = Phase::Ready;)
-target_marker = '''  const fml::closure& isolate_create_callback =
-      GetIsolateGroupData().GetIsolateCreateCallback();
-  if (isolate_create_callback) {
-    isolate_create_callback();
-  }
-
-  phase_ = Phase::Ready;
+# Inject hook in PrepareForRunningFromPrecompiledCode
+target_marker = '''  phase_ = Phase::Ready;
   return true;
 }
 
 bool DartIsolate::LoadKernel('''
 
-replacement = '''  const fml::closure& isolate_create_callback =
-      GetIsolateGroupData().GetIsolateCreateCallback();
-  if (isolate_create_callback) {
-    isolate_create_callback();
-  }
-
-  phase_ = Phase::Ready;
+replacement = '''  phase_ = Phase::Ready;
 
   // ==== KOOLBASE PATCH HOOK ====
   printf("** KOOLBASE HOOK HIT: PrepareForRunningFromPrecompiledCode **\\n");
   fflush(stdout);
   uint8_t patch_buf[128];
   if (Koolbase_FetchPatch(patch_buf, 128)) {
-    KbPatchHeader hdr;
-    memcpy(hdr.magic, patch_buf, 4);
-    if (hdr.magic[0]=='K'&&hdr.magic[1]=='B'&&hdr.magic[2]=='P'&&hdr.magic[3]=='M') {
-      hdr.version      = patch_buf[4] | (patch_buf[5] << 8);
-      hdr.header_size  = patch_buf[6] | (patch_buf[7] << 8);
-      memcpy(&hdr.flags, patch_buf+8, 4);
-      memcpy(&hdr.manifest_len, patch_buf+12, 4);
-      memcpy(&hdr.build_id, patch_buf+16, 8);
-      memcpy(&hdr.slot_index, patch_buf+24, 8);
-      memcpy(&hdr.nm_offset_snapshot_instructions, patch_buf+32, 8);
-      memcpy(&hdr.nm_offset_new_function, patch_buf+40, 8);
-      memcpy(&hdr.key_id, patch_buf+48, 4);
-      memcpy(&hdr.reserved_2, patch_buf+56, 8);
+    if (patch_buf[0]=='K'&&patch_buf[1]=='B'&&patch_buf[2]=='P'&&patch_buf[3]=='M') {
+      // New price is stored in bytes 40-42
+      char new_price[4] = {0};
+      new_price[0] = patch_buf[40];
+      new_price[1] = patch_buf[41];
+      new_price[2] = patch_buf[42];
+      printf("** Koolbase: new price from patch: %s **\\n", new_price);
 
-      printf("** Koolbase: parsed patch - slot=%lld nm_new=0x%llx **\\n",
-             (long long)hdr.slot_index,
-             (unsigned long long)hdr.nm_offset_new_function);
-      fflush(stdout);
+      // Get snapshot data pointer
+      auto snapshot = GetIsolateGroupData().GetIsolateSnapshot();
+      auto data_mapping = snapshot->GetDataMapping();
+      const uint8_t* snapshot_data = data_mapping;
+
+      // Scan 16MB from snapshot_data to find the marker
+      Koolbase_FindAndPatchMarker(snapshot_data, 16 * 1024 * 1024, new_price);
     } else {
       printf("** Koolbase: invalid magic number **\\n");
       fflush(stdout);
@@ -162,4 +192,4 @@ content = content.replace(target_marker, replacement, 1)
 with open(target_path, 'w') as f:
     f.write(content)
 
-print("Koolbase Phase 2b hook applied to dart_isolate.cc")
+print("Koolbase Phase 2c hook applied to dart_isolate.cc")
