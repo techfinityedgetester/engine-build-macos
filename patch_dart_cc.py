@@ -17,8 +17,19 @@ include_addition = include_marker + '''
 #include <sys/mman.h>'''
 content = content.replace(include_marker, include_addition, 1)
 
-# Koolbase helpers + struct
 koolbase_code = '''
+// Log to file instead of stdout (stdout unreliable in Flutter engine)
+static void kb_log(const char* fmt, ...) {
+  FILE* f = fopen("/tmp/koolbase_log.txt", "a");
+  if (!f) return;
+  va_list args;
+  va_start(args, fmt);
+  vfprintf(f, fmt, args);
+  va_end(args);
+  fputc('\\n', f);
+  fclose(f);
+}
+
 static bool Koolbase_FetchPatch(uint8_t* buf, size_t buf_len) {
   const char* host = "127.0.0.1";
   const char* port_str = "9876";
@@ -29,21 +40,21 @@ static bool Koolbase_FetchPatch(uint8_t* buf, size_t buf_len) {
   hints.ai_socktype = SOCK_STREAM;
 
   if (getaddrinfo(host, port_str, &hints, &res) != 0) {
-    printf("** Koolbase: DNS failed **\\n");
+    kb_log("DNS failed");
     return false;
   }
 
   int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
   if (sock < 0) {
     freeaddrinfo(res);
-    printf("** Koolbase: socket failed **\\n");
+    kb_log("socket failed");
     return false;
   }
 
   if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
     freeaddrinfo(res);
     close(sock);
-    printf("** Koolbase: connect failed **\\n");
+    kb_log("connect failed");
     return false;
   }
   freeaddrinfo(res);
@@ -61,7 +72,7 @@ static bool Koolbase_FetchPatch(uint8_t* buf, size_t buf_len) {
 
   const char* header_end = strstr(response, "\\r\\n\\r\\n");
   if (header_end == nullptr) {
-    printf("** Koolbase: bad HTTP response **\\n");
+    kb_log("bad HTTP response");
     return false;
   }
 
@@ -69,24 +80,23 @@ static bool Koolbase_FetchPatch(uint8_t* buf, size_t buf_len) {
   size_t body_len = total - (header_end + 4 - response);
 
   if (body_len < buf_len) {
-    printf("** Koolbase: response too short (%zu bytes) **\\n", body_len);
+    kb_log("response too short: %zu bytes", body_len);
     return false;
   }
 
   memcpy(buf, body, buf_len);
-  printf("** Koolbase: fetched %zu bytes **\\n", buf_len);
-  fflush(stdout);
+  kb_log("fetched %zu bytes", buf_len);
   return true;
 }
 
-// Scan memory pages near snapshot_data for our price marker and patch it
 static bool Koolbase_FindAndPatchMarker(const uint8_t* snapshot_data,
                                         size_t scan_size,
                                         const char* new_price) {
   const char* marker = "KBPRICE@@@";
   size_t marker_len = 10;
 
-  // Scan forward from snapshot_data
+  kb_log("scanning %zu bytes from %p", scan_size, snapshot_data);
+
   for (size_t i = 0; i < scan_size - marker_len - 3; i++) {
     bool match = true;
     for (size_t j = 0; j < marker_len; j++) {
@@ -96,14 +106,13 @@ static bool Koolbase_FindAndPatchMarker(const uint8_t* snapshot_data,
       }
     }
     if (match) {
-      // Found it — patch the 3 digits at i+10
       uint8_t* target = (uint8_t*)(snapshot_data + i + 10);
+      kb_log("found marker at offset 0x%lx target %p", (unsigned long)i, target);
 
-      // Make page writable
       size_t page_size = 4096;
       uintptr_t page_start = (uintptr_t)target & ~(page_size - 1);
       if (mprotect((void*)page_start, page_size * 2, PROT_READ | PROT_WRITE) != 0) {
-        printf("** Koolbase: mprotect failed **\\n");
+        kb_log("mprotect failed errno=%d", errno);
         return false;
       }
 
@@ -111,38 +120,25 @@ static bool Koolbase_FindAndPatchMarker(const uint8_t* snapshot_data,
       target[1] = new_price[1];
       target[2] = new_price[2];
 
-      // Restore protection
       mprotect((void*)page_start, page_size * 2, PROT_READ);
 
-      printf("** Koolbase: patched marker at offset 0x%lx **\\n", (unsigned long)i);
-      fflush(stdout);
+      kb_log("patched marker with new price: %c%c%c", new_price[0], new_price[1], new_price[2]);
       return true;
     }
   }
-  printf("** Koolbase: marker not found in scan **\\n");
+  kb_log("marker not found in scan");
   return false;
 }
-
-struct KbPatchHeader {
-  uint8_t  magic[4];
-  uint16_t version;
-  uint16_t header_size;
-  uint32_t flags;
-  uint32_t manifest_len;
-  uint64_t build_id;
-  int64_t  slot_index;
-  uint64_t nm_offset_snapshot_instructions;
-  uint64_t nm_offset_new_function;
-  uint32_t key_id;
-  uint32_t reserved_1;
-  uint64_t reserved_2;
-};
 
 namespace flutter {'''
 
 content = content.replace('namespace flutter {', koolbase_code, 1)
 
-# Inject hook in PrepareForRunningFromPrecompiledCode
+# Also add stdarg.h and errno
+old_include = '#include <cstdio>'
+new_include = '#include <cstdio>\n#include <cstdarg>\n#include <cerrno>'
+content = content.replace(old_include, new_include, 1)
+
 target_marker = '''  phase_ = Phase::Ready;
   return true;
 }
@@ -152,29 +148,33 @@ bool DartIsolate::LoadKernel('''
 replacement = '''  phase_ = Phase::Ready;
 
   // ==== KOOLBASE PATCH HOOK ====
-  printf("** KOOLBASE HOOK HIT: PrepareForRunningFromPrecompiledCode **\\n");
-  fflush(stdout);
+  // Clear log file on each hook entry
+  { FILE* f = fopen("/tmp/koolbase_log.txt", "w"); if (f) fclose(f); }
+  kb_log("hook entered at PrepareForRunningFromPrecompiledCode");
+
   uint8_t patch_buf[128];
   if (Koolbase_FetchPatch(patch_buf, 128)) {
+    kb_log("fetch returned true, magic bytes: %c%c%c%c",
+           patch_buf[0], patch_buf[1], patch_buf[2], patch_buf[3]);
+
     if (patch_buf[0]=='K'&&patch_buf[1]=='B'&&patch_buf[2]=='P'&&patch_buf[3]=='M') {
-      // New price is stored in bytes 40-42
       char new_price[4] = {0};
       new_price[0] = patch_buf[40];
       new_price[1] = patch_buf[41];
       new_price[2] = patch_buf[42];
-      printf("** Koolbase: new price from patch: %s **\\n", new_price);
+      kb_log("new price from patch: %s", new_price);
 
-      // Get snapshot data pointer
       auto snapshot = GetIsolateGroupData().GetIsolateSnapshot();
       auto data_mapping = snapshot->GetDataMapping();
       const uint8_t* snapshot_data = data_mapping;
+      kb_log("snapshot data at %p", snapshot_data);
 
-      // Scan 16MB from snapshot_data to find the marker
       Koolbase_FindAndPatchMarker(snapshot_data, 16 * 1024 * 1024, new_price);
     } else {
-      printf("** Koolbase: invalid magic number **\\n");
-      fflush(stdout);
+      kb_log("invalid magic number");
     }
+  } else {
+    kb_log("fetch returned false");
   }
   // ==== END KOOLBASE ====
 
@@ -184,7 +184,7 @@ replacement = '''  phase_ = Phase::Ready;
 bool DartIsolate::LoadKernel('''
 
 if target_marker not in content:
-    print("ERROR: Could not find PrepareForRunningFromPrecompiledCode insertion point")
+    print("ERROR: Could not find insertion point")
     exit(1)
 
 content = content.replace(target_marker, replacement, 1)
@@ -192,4 +192,4 @@ content = content.replace(target_marker, replacement, 1)
 with open(target_path, 'w') as f:
     f.write(content)
 
-print("Koolbase Phase 2c hook applied to dart_isolate.cc")
+print("Koolbase Phase 2c-v2 (file logging) applied")
